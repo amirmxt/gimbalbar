@@ -130,6 +130,13 @@ final class Gimbal: ObservableObject {
     @Published var range = ptz_range_t(panMin: -35, panMax: 215, tiltMin: -90, tiltMax: 90)
     @Published private(set) var savedPositions: [SavedPosition] = []
     @Published private(set) var isTransitioning = false
+    // zoom é o alvo selecionado no controle; zoomActual é o último valor lido da câmera.
+    @Published var zoom = 1.0
+    @Published private(set) var zoomActual = 1.0
+    @Published private(set) var zoomMin = 1.0
+    @Published private(set) var zoomMax = 4.0
+    @Published private(set) var zoomAvailable = false
+    @Published private(set) var zoomStatus = "Conecte a Pocket 3"
 
     @AppStorage("step") var step = 15.0
     @AppStorage("invertPan") var invertPan = false
@@ -155,6 +162,14 @@ final class Gimbal: ObservableObject {
     private var reading = false
     private var moveRevision: UInt64 = 0
     private var rangeAttempted = false
+    private var zoomRangeAttempted = false
+    private var zoomPollingTicks = 0
+    private var zoomEditing = false
+    private var zoomSending = false
+    private var zoomPending: Int32?
+    private var zoomCommitTimer: Timer?
+    private var zoomRevision: UInt64 = 0
+    private var zoomSettlingUntil = Date.distantPast
     private var timer: Timer?
     private var transitionTimer: Timer?
     private var transitionDestination: (pan: Double, tilt: Double)?
@@ -172,31 +187,153 @@ final class Gimbal: ObservableObject {
     }
 
     func refresh() {
-        // Never accumulate USB reads if the device is slow or disconnected.
-        guard !sending && !reading else { return }
+        // PTZ and zoom share a single serial IOKit USB queue.
+        guard !sending && !reading && !zoomSending else { return }
         reading = true
         let revision = moveRevision
         let probeRange = !rangeAttempted
+        let probeZoom = !zoomRangeAttempted
+        zoomPollingTicks += 1
+        let readZoom = probeZoom || zoomPollingTicks >= 2
+        if readZoom { zoomPollingTicks = 0 }
+        let zoomReadRevision = zoomRevision
         usb.async {
             var p = 0.0, t = 0.0
             let ok = ptz_get(&p, &t) == 0
             var discoveredRange = ptz_range_t()
             let gotRange = ok && probeRange && ptz_range(&discoveredRange) == 0
+
+            var zMin: Int32 = 0, zMax: Int32 = 0, zCurrent: Int32 = 0
+            let gotZoomRange = ok && probeZoom && ptz_zoom_range(&zMin, &zMax) == 0
+            let gotZoomCurrent = ok && readZoom && ptz_zoom_get(&zCurrent) == 0
+
             Task { @MainActor in
                 self.reading = false
                 self.connected = ok
                 if ok {
                     if probeRange { self.rangeAttempted = true }
                     if gotRange { self.range = discoveredRange }
-                    // Ignore a stale read that began before a user movement.
-                    if !self.sending && !self.isTransitioning && self.moveRevision == revision {
+                    if probeZoom {
+                        self.zoomRangeAttempted = true
+                        // Limit the experimental UI to the camera's verified 1×–4× range.
+                        self.zoomAvailable = gotZoomRange && zMin >= 100
+                            && zMax <= 400 && zMax > zMin
+                        if self.zoomAvailable {
+                            self.zoomMin = Double(zMin) / 100.0
+                            self.zoomMax = Double(zMax) / 100.0
+                            self.zoomStatus = ""
+                        } else {
+                            self.zoomStatus = "Zoom nativo indisponível via USB"
+                        }
+                    }
+                    // Exibir a leitura real separadamente. Leituras iniciadas antes de
+                    // um novo comando nunca devem empurrar a posição do controle.
+                    if gotZoomCurrent && self.zoomAvailable &&
+                        self.zoomRevision == zoomReadRevision && !self.zoomSending {
+                        let measured = min(max(Double(zCurrent) / 100.0,
+                                               self.zoomMin), self.zoomMax)
+                        self.zoomActual = measured
+                        if !self.zoomEditing && self.zoomPending == nil &&
+                           Date() >= self.zoomSettlingUntil {
+                            // Somente um valor lido depois da estabilização move
+                            // o slider; assim ele espelha a posição real informada.
+                            self.zoom = measured
+                            self.zoomStatus = ""
+                        }
+                    }
+                    // Ignore stale PTZ reads invalidated by a user movement.
+                    if !self.sending && !self.isTransitioning &&
+                        self.moveRevision == revision {
                         self.pan = p
                         self.tilt = t
                     }
                 } else {
-                    // Re-read device limits the next time the camera comes back.
+                    // Re-probe on the next USB reconnect.
                     self.rangeAttempted = false
+                    self.zoomRangeAttempted = false
+                    self.zoomAvailable = false
+                    self.zoomEditing = false
+                    self.zoomPending = nil
+                    self.zoomCommitTimer?.invalidate()
+                    self.zoomCommitTimer = nil
+                    self.zoomRevision &+= 1
+                    self.zoomStatus = "Conecte a Pocket 3"
                     self.cancelTransition()
+                }
+            }
+        }
+    }
+
+    // Os comandos são agrupados: no máximo uma escrita por janela de 160 ms.
+    // A seleção continua responsiva durante escritas USB; o último alvo vence.
+    func selectZoom(_ requested: Double) {
+        guard connected && zoomAvailable else { return }
+        let clamped = min(max(requested, zoomMin), zoomMax)
+        let target = (clamped * 10.0).rounded() / 10.0
+        zoom = target
+        zoomPending = Int32((target * 100.0).rounded())
+        zoomRevision &+= 1
+        zoomStatus = "Ajustando zoom…"
+        scheduleZoomCommit()
+    }
+
+    func zoomEditingChanged(_ editing: Bool) {
+        zoomEditing = editing
+        if !editing {
+            // Enviar a última posição assim que o usuário soltar.
+            zoomCommitTimer?.invalidate()
+            zoomCommitTimer = nil
+            sendPendingZoom()
+        }
+    }
+
+    func setZoom(_ requested: Double) {
+        // Mesmo caminho do slider: botão 1× pode interromper uma escrita lenta
+        // e enfileira somente o novo alvo, sem bloquear a interface.
+        selectZoom(requested)
+        zoomCommitTimer?.invalidate()
+        zoomCommitTimer = nil
+        sendPendingZoom()
+    }
+
+    private func scheduleZoomCommit() {
+        guard zoomCommitTimer == nil && !zoomSending else { return }
+        zoomCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.16,
+                                               repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.zoomCommitTimer = nil
+                self?.sendPendingZoom()
+            }
+        }
+    }
+
+    private func sendPendingZoom() {
+        guard connected && zoomAvailable && !zoomSending,
+              let target = zoomPending else { return }
+        zoomPending = nil
+        zoomSending = true
+        let verifiedMin = Int32((zoomMin * 100.0).rounded())
+        let verifiedMax = Int32((zoomMax * 100.0).rounded())
+
+        usb.async {
+            // Limites verificados na conexão e novamente validados no driver C.
+            // Evita dois GETs extras a cada pequena alteração.
+            let ok = ptz_zoom_set_checked(target, verifiedMin, verifiedMax) == 0
+            Task { @MainActor in
+                self.zoomSending = false
+                if !ok {
+                    self.zoomPending = nil
+                    self.zoomCommitTimer?.invalidate()
+                    self.zoomCommitTimer = nil
+                    self.zoomStatus = "Falha ao enviar zoom; reconecte a câmera"
+                    self.zoomAvailable = false
+                    self.zoomRangeAttempted = false
+                    return
+                }
+                self.zoomSettlingUntil = Date().addingTimeInterval(1.2)
+                self.zoomStatus = "Aguardando confirmação da câmera…"
+                if self.zoomPending != nil {
+                    self.scheduleZoomCommit()
                 }
             }
         }
@@ -636,13 +773,48 @@ struct Panel: View {
                                         .font(.caption2).foregroundStyle(.tertiary)
                                 }
                     Divider()
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("Zoom da câmera", systemImage: "plus.magnifyingglass")
+                                .font(.subheadline.weight(.medium))
+                            Spacer()
+                            Text(String(format: "%.1f×", g.zoom))
+                                .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                                .monospacedDigit()
+                        }
+
+                        HStack(spacing: 9) {
+                            Slider(value: Binding(
+                                get: { g.zoom },
+                                set: { g.selectZoom($0) }
+                            ), in: g.zoomMin...g.zoomMax, step: 0.1,
+                                   onEditingChanged: { editing in
+                                g.zoomEditingChanged(editing)
+                            })
+                            .disabled(!g.connected || !g.zoomAvailable)
+                            Button("1×") { g.setZoom(g.zoomMin) }
+                                .disabled(!g.connected || !g.zoomAvailable)
+                                .controlSize(.small)
+                        }
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(String(format: "Câmera: %.1f×", g.zoomActual))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            Text(g.zoomStatus)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Divider()
                     VStack(alignment: .leading, spacing: 10) {
                                     Label("Atalhos de teclado", systemImage: "keyboard")
                                         .font(.subheadline.weight(.medium))
                     
                                     Toggle("Ativar atalhos globais", isOn: $g.hotkeysEnabled)
                                         .toggleStyle(.switch)
-                                        .onChange(of: g.hotkeysEnabled) { _ in
+                                        .onChange(of: g.hotkeysEnabled) {
                                             g.hotkeyStatus = HotKeys.configure()
                                         }
                     
@@ -653,7 +825,7 @@ struct Panel: View {
                                     }
                                     .pickerStyle(.segmented)
                                     .disabled(!g.hotkeysEnabled)
-                                    .onChange(of: g.hotkeyModifiers) { _ in
+                                    .onChange(of: g.hotkeyModifiers) {
                                         g.hotkeyStatus = HotKeys.configure()
                                     }
                     
@@ -671,7 +843,7 @@ struct Panel: View {
             .frame(maxHeight: .infinity, alignment: .top)
             Divider()
             HStack {
-                            Text("Versão 1.1 · Em desenvolvimento")
+                            Text("Versão 1.2 · Zoom nativo experimental")
                                 .font(.caption2).foregroundStyle(.tertiary)
                             Spacer()
                             Button("Sair") { NSApp.terminate(nil) }
