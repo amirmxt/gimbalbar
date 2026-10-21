@@ -39,6 +39,8 @@ Needs the Xcode command line tools.
 
 Not affiliated with or endorsed by DJI. Tested only on the Osmo Pocket 3.
 
+Use at your own risk. This is a hobby project provided as is, with no warranty of any kind. It sends USB control commands that move the gimbal's motors. The author is not responsible or liable for any damage to your camera, gimbal, computer or data, voided warranties, injury, or any other loss that results from using, building or modifying this software. See the [LICENSE](LICENSE) for the full terms.
+
 ## License
 
 MIT
