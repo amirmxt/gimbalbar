@@ -1,33 +1,77 @@
-# GimbalBar: build and hardware verification
+# GimbalBar 1.1 — instalação e validação
 
-This fork is under active development. The original project's MIT license and upstream history are preserved.
+Projeto derivado do GimbalBar original de https://github.com/amirmxt/gimbalbar. Histórico e licença MIT preservados. Compilação e testes devem ser realizados localmente para economizar GitHub Actions.
 
-## Requirements
+## Requisitos
 
-- macOS 14 or later on Apple Silicon
-- Xcode Command Line Tools (`xcode-select -p`)
-- DJI Osmo Pocket 3 connected by USB-C with **Webcam** mode selected
-- macOS camera permission for GimbalBar
+- Mac Apple Silicon com macOS 14 ou posterior
+- Xcode Command Line Tools
+- DJI Osmo Pocket 3 conectada por USB-C e configurada em **Webcam**
+- Permissão de câmera para o GimbalBar no macOS
 
-## Build and run the development branch
+## Recursos disponíveis
+
+- Prévia ao vivo e controle USB do gimbal
+- Reconexão automática da câmera
+- Interface horizontal em português brasileiro, com duas colunas e **sem rolagem**
+- Três posições persistentes (P1, P2, P3) e recuperação com movimento em etapas
+- Movimento por software em ritmos **Suave**, **Normal** e **Rápida**
+- Atalhos globais habilitáveis e três perfis de modificadores (⌃⌥, ⌘⌥, ⌃⇧), com setas, C e teclas 1–3
+- Interromper movimento iniciado por preset; operação manual cancela a trajetória programada
+
+A movimentação suave é implementada enviando pequenas posições absolutas, não por ajuste direto da velocidade do motor. A câmera pode continuar completando um comando já recebido mesmo após interromper o envio de novas etapas. Não constitui parada de emergência.
+
+## Instalar a compilação consolidada
+
+Após as PRs #2 e #3 serem integradas à `main`, feche o GimbalBar e execute:
 
 ```bash
 cd ~/Projects/gimbalbar
-git fetch origin
-git switch --track origin/feat/usb-preview-reliability
+git switch main
+git pull --ff-only
 ./build.sh
-open ./GimbalBar.app
 ```
 
-If that branch already exists locally, use `git switch feat/usb-preview-reliability` followed by `git pull --ff-only`.
+**Continue apenas se aparecer `Built .../GimbalBar.app` e não houver erro.**
 
-Build locally; do not run GitHub Actions merely to validate this iteration. The build script replaces `build/` and `GimbalBar.app/` **inside the repository**, but does not install anything into `/Applications`.
+```bash
+pkill -x GimbalBar 2>/dev/null || true
+backup="$HOME/Desktop/GimbalBar-backup-antes-1.1.app"
+if [ -d /Applications/GimbalBar.app ] && [ ! -e "$backup" ]; then
+  ditto /Applications/GimbalBar.app "$backup"
+fi
+ditto ./GimbalBar.app /Applications/GimbalBar.app
+open /Applications/GimbalBar.app
+```
 
-## Swift 6.4 / Command Line Tools troubleshooting
+Isso preserva um backup único da versão anterior na Mesa e substitui o aplicativo instalado somente depois da compilação bem-sucedida. O identificador do aplicativo foi mantido, preservando as preferências locais.
 
-If the compiler reports `external macro implementation type 'SwiftUIMacros.StateMacro' could not be found`, the issue can arise from the Command Line Tools compiler lacking the `SwiftUIMacros` plugin. The source uses `@StoredState` (an alias for the `SwiftUI.State` property wrapper) instead of direct `@State` to avoid the macro dependency.
+## Testes essenciais da versão 1.1
 
-To inspect your environment:
+1. Confirmar que o painel horizontal aparece inteiro, sem barra de rolagem, em português.
+2. Validar prévia, movimentação pelo pad e setas, inversão horizontal e centralização.
+3. Salvar P1, P2 e P3; retornar a cada uma e conferir persistência após fechar/reabrir.
+4. Testar movimentos Suave, Normal e Rápida e o comando **Interromper**.
+5. Durante um retorno a posição salva, movimentar manualmente e verificar cancelamento da trajetória programada.
+6. Ativar/desativar atalhos, alternar perfis ⌃⌥ / ⌘⌥ / ⌃⇧ e recuperar P1–P3.
+7. Desconectar/reconectar a Pocket 3 em Webcam e conferir retomada da prévia e controles.
+8. Confirmar que a ausência da câmera não executa movimentos de gimbal.
+
+**Segurança:** manter motores desobstruídos, iniciar com ritmo Suave e evitar movimentos sem supervisão.
+
+## Histórico de validação — 21/10/2026
+
+- Versão 1.0: compilação local e controles USB funcionando; reconexão validada pelo usuário.
+- Versão 1.1, PR #2: usuário confirmou que a versão experimental funcionou.
+- Versão 1.1, PR #3: a primeira tentativa de layout com `ScrollView` ficou praticamente invisível. Foi substituída por um painel horizontal de largura e altura fixas, sem rolagem, traduzido para português.
+- Usuário aprovou o novo layout e posteriormente confirmou: **"Tudo ok"**, em resposta à solicitação de validação funcional de atalhos, cancelamento e reconexão.
+- Confirmação de compilação/instalação do executável **consolidado da `main`** ainda é necessária; o teste anterior foi feito na branch experimental, antes da atualização dos metadados da versão.
+
+## Diagnóstico do compilador
+
+Uma versão anterior falhou com `SwiftUIMacros.StateMacro` não encontrado nas Command Line Tools. O ajuste `@StoredState` contornou essa incompatibilidade no MacBook testado.
+
+Em caso de erro no build:
 
 ```bash
 xcode-select -p
@@ -35,29 +79,8 @@ xcrun --find swiftc
 swiftc --version
 ```
 
-After fetching this branch, run `./build.sh` again. A successful build ends with `Built .../GimbalBar.app`. Only run `open ./GimbalBar.app` after that message. Do not interpret the creation of an incomplete `.app` directory as a successful compilation.
+Referência do problema: https://github.com/drumih/turbo-fieldfare/issues/185
 
-Reference: https://github.com/drumih/turbo-fieldfare/issues/185 and https://github.com/drumih/turbo-fieldfare/pull/186
+## Política de integração
 
-## Manual smoke tests
-
-1. **Without camera:** Open GimbalBar. The menu panel should report "Not connected" / "Pocket 3 not found". Buttons must not queue physical movements.
-2. **Attach the camera:** Plug in the Pocket 3 and select Webcam mode. Confirm the connection indicator, preview, and reported pan/tilt position update.
-3. **Movement:** With the camera on a stable surface and the gimbal unobstructed, select a 5° step and move once in each direction. Confirm the actual movement. Test center once.
-4. **High-frequency control:** Drag the movement pad briefly. Confirm commands do not accumulate or keep moving after the drag ends.
-5. **Hot unplug/replug with panel open:** Remove USB, verify preview/status update, reconnect in Webcam mode, and verify the preview and pan/tilt return *without restarting the app*.
-6. **Hot unplug/replug with panel closed:** Repeat with the popover closed and reopen it after reconnection.
-7. **Stress test:** Repeat reconnection three times; verify no duplicated preview sessions, frozen UI, or stale camera input.
-8. **Global shortcuts:** Test Control-Option + arrows and Control-Option-C from another app; document any conflicting system shortcuts.
-9. **Camera authorization:** Revoke permission in System Settings and relaunch; verify a visible explanatory status.
-
-## Expected limitations
-
-- This is a source-only development change; **no Mac build or physical Pocket 3 test has been run by the GitHub connector**.
-- Disconnect/reconnect depends on macOS delivering AVCaptureDevice connection notifications.
-- One probe of pan/tilt limits is attempted per detected USB connection; fallback values remain when the camera cannot report limits.
-- Software must not be assumed to prevent collisions or protect gimbal motors.
-
-## Release gate
-
-Do not merge to `main` or replace a working installation until compilation and the smoke tests pass. Record the macOS version, Swift compiler version (`swiftc --version`), camera firmware version, failures, and relevant console output in the PR.
+Desenvolvimento em branches, PRs de revisão e testes de hardware locais. Não habilitar automações de CI custosas apenas para reproduzir testes que exigem a câmera.
