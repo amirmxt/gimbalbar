@@ -24,23 +24,23 @@ typedef struct {
 } Probe;
 
 static const Probe cameraProbes[] = {
-    { "Exposicao automatica (AE)", 0x02,  1, 1 },
-    { "Tempo de exposicao",        0x04,  3, 4 },
-    { "Foco manual",               0x06,  5, 2 },
-    { "Foco automatico",           0x08, 17, 1 },
-    { "Zoom absoluto",             0x0b,  9, 2 },
-    { "Pan/Tilt absoluto",         0x0d, 11, 8 }
+    { "Auto exposure (AE)", 0x02,  1, 1 },
+    { "Exposure time",        0x04,  3, 4 },
+    { "Manual focus",               0x06,  5, 2 },
+    { "Auto focus",           0x08, 17, 1 },
+    { "Absolute zoom",             0x0b,  9, 2 },
+    { "Absolute pan/tilt",         0x0d, 11, 8 }
 };
 
 static const Probe processingProbes[] = {
-    { "Brilho",                    0x02,  0, 2 },
-    { "Contraste",                 0x03,  1, 2 },
-    { "Ganho",                     0x04,  9, 2 },
-    { "Saturacao",                 0x07,  3, 2 },
-    { "Nitidez",                   0x08,  4, 2 },
-    { "Temperatura de branco",     0x0a,  6, 2 },
-    { "Branco automatico",         0x0b, 12, 1 },
-    { "Compensacao de contraluz",  0x01,  8, 2 }
+    { "Brightness",                    0x02,  0, 2 },
+    { "Contrast",                 0x03,  1, 2 },
+    { "Gain",                     0x04,  9, 2 },
+    { "Saturation",                 0x07,  3, 2 },
+    { "Sharpness",                   0x08,  4, 2 },
+    { "White balance temperature",     0x0a,  6, 2 },
+    { "Auto white balance",         0x0b, 12, 1 },
+    { "Backlight compensation",  0x01,  8, 2 }
 };
 
 static IOUSBDeviceInterface **open_pocket3(void) {
@@ -114,7 +114,7 @@ static void probe_controls(IOUSBDeviceInterface **device, uint8_t iface,
     for (size_t i = 0; i < count; ++i) {
         const Probe *p = &items[i];
         if (!is_advertised(bitmap, size, p->advertisedBit)) {
-            printf("  %-28s : nao anunciado\n", p->name);
+            printf("  %-28s : not advertised\n", p->name);
             continue;
         }
 
@@ -122,18 +122,18 @@ static void probe_controls(IOUSBDeviceInterface **device, uint8_t iface,
         IOReturn err = read_uvc(device, iface, entity, p->selector,
                                 GET_INFO, &info, 1);
         if (err != kIOReturnSuccess) {
-            printf("  %-28s : anunciado; GET_INFO falhou (0x%08x)\n",
+            printf("  %-28s : advertised; GET_INFO failed (0x%08x)\n",
                    p->name, (unsigned)err);
             continue;
         }
-        printf("  %-28s : anunciado; GET=%s; SET=%s\n",
-               p->name, (info & 0x01) ? "sim" : "nao",
-               (info & 0x02) ? "sim" : "nao");
+        printf("  %-28s : advertised; GET=%s; SET=%s\n",
+               p->name, (info & 0x01) ? "yes" : "no",
+               (info & 0x02) ? "yes" : "no");
 
         if (!values || !(info & 0x01)) continue;
 
         const struct { uint8_t command; const char *label; } reads[] = {
-            { GET_CUR, "atual" }, { GET_MIN, "minimo" }, { GET_MAX, "maximo" }
+            { GET_CUR, "current" }, { GET_MIN, "minimum" }, { GET_MAX, "maximum" }
         };
         for (size_t j = 0; j < sizeof(reads) / sizeof(reads[0]); ++j) {
             uint8_t buffer[8] = {0};
@@ -142,7 +142,7 @@ static void probe_controls(IOUSBDeviceInterface **device, uint8_t iface,
             if (err == kIOReturnSuccess) {
                 print_value(reads[j].label, buffer, p->valueSize);
             } else {
-                printf("      %s: indisponivel (0x%08x)\n",
+                printf("      %s: unavailable (0x%08x)\n",
                        reads[j].label, (unsigned)err);
             }
         }
@@ -156,18 +156,18 @@ static unsigned inspect_configuration(IOUSBDeviceInterface **device,
         device, configurationIndex, &config
     );
     if (err != kIOReturnSuccess || !config) {
-        printf("Configuracao %u: descritor indisponivel (0x%08x)\n",
+        printf("Configuration %u: descriptor unavailable (0x%08x)\n",
                configurationIndex, (unsigned)err);
         return 0;
     }
     const uint8_t *bytes = (const uint8_t *)config;
     const size_t total = (size_t)bytes[2] | ((size_t)bytes[3] << 8);
     if (total < 9 || total > 65535) {
-        printf("Descritor de configuracao invalido\n");
+        printf("Invalid configuration descriptor\n");
         return 0;
     }
 
-    printf("Configuracao %u: %zu bytes de descritores\n",
+    printf("Configuration %u: %zu descriptor bytes\n",
            configurationIndex, total);
     bool videoControlInterface = false;
     uint8_t interfaceID = 0;
@@ -177,7 +177,7 @@ static unsigned inspect_configuration(IOUSBDeviceInterface **device,
         const uint8_t *descriptor = bytes + offset;
         const size_t length = descriptor[0];
         if (length < 2 || length > total - offset) {
-            printf("Descritor truncado/invalido em %zu; interrompendo\n", offset);
+            printf("Truncated/invalid descriptor at %zu; stopping\n", offset);
             break;
         }
         const uint8_t type = descriptor[1];
@@ -231,30 +231,30 @@ static unsigned inspect_configuration(IOUSBDeviceInterface **device,
 int main(int argc, char **argv) {
     bool values = false;
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "--values") != 0)) {
-        fprintf(stderr, "Uso: uvc_diag [--values]\n");
+        fprintf(stderr, "Usage: uvc_diag [--values]\n");
         return 2;
     }
     if (argc == 2) values = true;
 
-    printf("GimbalBar 1.2 — diagnostico USB UVC (SOMENTE LEITURA)\n");
+    printf("GimbalBar 1.2 — USB UVC diagnostics (READ ONLY)\n");
     printf("DJI Osmo Pocket 3 VID=0x%04x PID=0x%04x\n", DJI_VENDOR, POCKET3_PRODUCT);
-    printf("Modo: descritores + GET_INFO%s. Nenhum comando SET sera enviado.\n\n",
+    printf("Mode: descriptors + GET_INFO%s. No SET command will be sent.\n\n",
            values ? " + GET_CUR/GET_MIN/GET_MAX" : "");
 
     IOUSBDeviceInterface **device = open_pocket3();
     if (!device) {
-        fprintf(stderr, "Pocket 3 nao localizada. Conecte por USB-C e selecione Webcam.\n");
+        fprintf(stderr, "Pocket 3 not found. Connect via USB-C and select Webcam mode.\n");
         return 1;
     }
 
     uint8_t configurationCount = 0;
     IOReturn err = (*device)->GetNumberOfConfigurations(device, &configurationCount);
     if (err != kIOReturnSuccess) {
-        fprintf(stderr, "Falha ao consultar configuracoes: 0x%08x\n", (unsigned)err);
+        fprintf(stderr, "Failed to query configurations: 0x%08x\n", (unsigned)err);
         (*device)->Release(device);
         return 1;
     }
-    printf("Configuracoes USB: %u\n", configurationCount);
+    printf("USB configurations: %u\n", configurationCount);
     unsigned discovered = 0;
     for (uint8_t i = 0; i < configurationCount; ++i)
         discovered += inspect_configuration(device, i, values);
@@ -262,11 +262,11 @@ int main(int argc, char **argv) {
     (*device)->Release(device);
     if (discovered == 0) {
         fprintf(stderr,
-                "\nNenhum terminal UVC identificado. Nao significa ausencia de recursos;\n"
-                "verifique modo Webcam, descritores e permissoes do sistema.\n");
+                "\nNo UVC terminal found. This does not prove lack of controls;\n"
+                "check Webcam mode, descriptors and system permissions.\n");
         return 3;
     }
-    printf("\nEntidades UVC identificadas: %u\n", discovered);
-    printf("Lembrete: controles anunciados nao garantem acesso pratico no macOS.\n");
+    printf("\nUVC entities found: %u\n", discovered);
+    printf("Note: advertised controls do not guarantee practical macOS access.\n");
     return 0;
 }
