@@ -130,7 +130,7 @@ final class Gimbal: ObservableObject {
     @Published var range = ptz_range_t(panMin: -35, panMax: 215, tiltMin: -90, tiltMax: 90)
     @Published private(set) var savedPositions: [SavedPosition] = []
     @Published private(set) var isTransitioning = false
-    // zoom é o alvo selecionado no controle; zoomActual é o último valor lido da câmera.
+    // zoom is the requested value; zoomActual is the last reported camera value.
     @Published var zoom = 1.0
     @Published private(set) var zoomActual = 1.0
     @Published private(set) var zoomMin = 1.0
@@ -227,7 +227,7 @@ final class Gimbal: ObservableObject {
                         }
                     }
                     // Exibir a leitura real separadamente. Leituras iniciadas antes de
-                    // um novo comando nunca devem empurrar a posição do controle.
+                    // a new command must never override the requested slider position.
                     if gotZoomCurrent && self.zoomAvailable &&
                         self.zoomRevision == zoomReadRevision && !self.zoomSending {
                         let measured = min(max(Double(zCurrent) / 100.0,
@@ -235,8 +235,8 @@ final class Gimbal: ObservableObject {
                         self.zoomActual = measured
                         if !self.zoomEditing && self.zoomPending == nil &&
                            Date() >= self.zoomSettlingUntil {
-                            // Somente um valor lido depois da estabilização move
-                            // o slider; assim ele espelha a posição real informada.
+                            // Only a reading after the settling period can update
+                            // the slider to reflect the last reported camera position.
                             self.zoom = measured
                             self.zoomStatus = ""
                         }
@@ -264,8 +264,8 @@ final class Gimbal: ObservableObject {
         }
     }
 
-    // Os comandos são agrupados: no máximo uma escrita por janela de 160 ms.
-    // A seleção continua responsiva durante escritas USB; o último alvo vence.
+    // Coalesce zoom commands: at most one request per 160 ms interval.
+    // UI stays responsive during USB writes; the latest target wins.
     func selectZoom(_ requested: Double) {
         guard connected && zoomAvailable else { return }
         let clamped = min(max(requested, zoomMin), zoomMax)
@@ -280,7 +280,7 @@ final class Gimbal: ObservableObject {
     func zoomEditingChanged(_ editing: Bool) {
         zoomEditing = editing
         if !editing {
-            // Enviar a última posição assim que o usuário soltar.
+            // Send the final target as soon as the user releases the slider.
             zoomCommitTimer?.invalidate()
             zoomCommitTimer = nil
             sendPendingZoom()
@@ -288,8 +288,8 @@ final class Gimbal: ObservableObject {
     }
 
     func setZoom(_ requested: Double) {
-        // Mesmo caminho do slider: botão 1× pode interromper uma escrita lenta
-        // e enfileira somente o novo alvo, sem bloquear a interface.
+        // Share slider pipeline: the 1x button can supersede a slow write
+        // and only queues its latest target, without blocking the UI.
         selectZoom(requested)
         zoomCommitTimer?.invalidate()
         zoomCommitTimer = nil
@@ -316,8 +316,8 @@ final class Gimbal: ObservableObject {
         let verifiedMax = Int32((zoomMax * 100.0).rounded())
 
         usb.async {
-            // Limites verificados na conexão e novamente validados no driver C.
-            // Evita dois GETs extras a cada pequena alteração.
+            // Zoom range was queried on connect and is revalidated by the C driver.
+            // Avoid two additional GETs for each incremental adjustment.
             let ok = ptz_zoom_set_checked(target, verifiedMin, verifiedMax) == 0
             Task { @MainActor in
                 self.zoomSending = false
