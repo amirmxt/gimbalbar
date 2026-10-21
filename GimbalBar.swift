@@ -2,44 +2,84 @@ import SwiftUI
 import AVFoundation
 import Carbon.HIToolbox
 
+// Avoid Swift 6.4 @State macro expansion: Command Line Tools may lack SwiftUIMacros.
+// This alias retains Apple's SwiftUI.State property-wrapper behavior.
+private typealias StoredState<Value> = SwiftUI.State<Value>
+
 // MARK: - Live preview
 
 final class Preview: ObservableObject {
     let session = AVCaptureSession()
     @Published var status = "Starting camera…"
     private let queue = DispatchQueue(label: "gimbal.preview")
-    private var configured = false
+    private var active = false
+    private var authorized = false
+    private var observers: [NSObjectProtocol] = []
+
+    init() {
+        // Camera sessions can retain stale inputs after unplug/replug.
+        let notifications = [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification]
+        observers = notifications.map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                guard let self else { return }
+                self.queue.async { self.refreshDevice() }
+            }
+        }
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
 
     func start() {
+        queue.async { self.active = true }
         AVCaptureDevice.requestAccess(for: .video) { granted in
-            guard granted else {
-                DispatchQueue.main.async { self.status = "Camera access denied in System Settings" }
-                return
-            }
             self.queue.async {
-                if !self.configured { self.configure() }
-                if self.configured, !self.session.isRunning { self.session.startRunning() }
+                guard self.active else { return }
+                self.authorized = granted
+                guard granted else {
+                    DispatchQueue.main.async { self.status = "Camera access denied in System Settings" }
+                    return
+                }
+                self.refreshDevice()
             }
         }
     }
 
     func stop() {
-        queue.async { if self.session.isRunning { self.session.stopRunning() } }
+        queue.async {
+            self.active = false
+            if self.session.isRunning { self.session.stopRunning() }
+        }
     }
 
-    private func configure() {
+    // All session configuration and start/stop operations run on one serial queue.
+    private func refreshDevice() {
+        guard active && authorized else { return }
         let found = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .video, position: .unspecified)
             .devices.first { $0.localizedName.localizedCaseInsensitiveContains("pocket") || $0.modelID.contains("VendorID_11427") }
-        guard let device = found, let input = try? AVCaptureDeviceInput(device: device) else {
-            DispatchQueue.main.async { self.status = "Pocket 3 not found" }
+        let current = session.inputs.compactMap { $0 as? AVCaptureDeviceInput }.first
+
+        if let found, current?.device.uniqueID == found.uniqueID {
+            if !session.isRunning { session.startRunning() }
+            DispatchQueue.main.async { self.status = "" }
             return
         }
+
+        if session.isRunning { session.stopRunning() }
         session.beginConfiguration()
-        session.sessionPreset = .medium
-        if session.canAddInput(input) { session.addInput(input) }
+        for input in session.inputs { session.removeInput(input) }
+        var ready = false
+        if let found, let input = try? AVCaptureDeviceInput(device: found), session.canAddInput(input) {
+            session.addInput(input)
+            ready = true
+        }
         session.commitConfiguration()
-        configured = true
-        DispatchQueue.main.async { self.status = "" }
+
+        if ready { session.startRunning() }
+        DispatchQueue.main.async {
+            self.status = ready ? "" : (found == nil ? "Pocket 3 not found" : "Unable to open Pocket 3 camera")
+        }
     }
 }
 
@@ -89,35 +129,54 @@ final class Gimbal: ObservableObject {
     private let usb = DispatchQueue(label: "gimbal.usb")
     private var pending: (Double, Double)?
     private var sending = false
+    private var reading = false
+    private var moveRevision: UInt64 = 0
+    private var rangeAttempted = false
     private var timer: Timer?
 
     init() {
         refresh()
-        usb.async {
-            var r = ptz_range_t()
-            if ptz_range(&r) == 0 { Task { @MainActor in self.range = r } }
-        }
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
             Task { @MainActor in self.refresh() }
         }
     }
 
     func refresh() {
-        guard !sending else { return }
+        // Never accumulate USB reads if the device is slow or disconnected.
+        guard !sending && !reading else { return }
+        reading = true
+        let revision = moveRevision
+        let probeRange = !rangeAttempted
         usb.async {
             var p = 0.0, t = 0.0
             let ok = ptz_get(&p, &t) == 0
+            var discoveredRange = ptz_range_t()
+            let gotRange = ok && probeRange && ptz_range(&discoveredRange) == 0
             Task { @MainActor in
+                self.reading = false
                 self.connected = ok
-                if ok, !self.sending { self.pan = p; self.tilt = t }
+                if ok {
+                    if probeRange { self.rangeAttempted = true }
+                    if gotRange { self.range = discoveredRange }
+                    // Ignore a stale read that began before a user movement.
+                    if !self.sending && self.moveRevision == revision {
+                        self.pan = p
+                        self.tilt = t
+                    }
+                } else {
+                    // Re-read device limits the next time the camera comes back.
+                    self.rangeAttempted = false
+                }
             }
         }
     }
 
     // Latest target wins; USB writes never queue up behind a drag.
     func go(pan: Double, tilt: Double) {
+        guard connected else { return }
         let p = min(max(pan, range.panMin), range.panMax)
         let t = min(max(tilt, range.tiltMin), range.tiltMax)
+        moveRevision &+= 1
         self.pan = p
         self.tilt = t
         pending = (p, t)
@@ -133,6 +192,13 @@ final class Gimbal: ObservableObject {
             let ok = ptz_set(p, t) == 0
             Task { @MainActor in
                 self.connected = ok
+                if !ok {
+                    // Stop issuing queued moves after a USB error.
+                    self.pending = nil
+                    self.sending = false
+                    self.rangeAttempted = false
+                    return
+                }
                 self.flush()
             }
         }
@@ -191,7 +257,7 @@ enum HotKeys {
 
 struct Pad: View {
     @ObservedObject var g: Gimbal
-    @State private var dragging = false
+    @StoredState private var dragging = false
 
     var body: some View {
         GeometryReader { geo in
