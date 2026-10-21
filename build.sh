@@ -34,7 +34,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleVersion</key><string>3</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
-  <key>NSCameraUsageDescription</key><string>Exibe a imagem da DJI Osmo Pocket 3 para controlar o enquadramento.</string>
+  <key>NSCameraUsageDescription</key><string>Shows the DJI Osmo Pocket 3 live preview to help control framing.</string>
 </dict></plist>
 EOF
 
