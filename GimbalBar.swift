@@ -2,44 +2,84 @@ import SwiftUI
 import AVFoundation
 import Carbon.HIToolbox
 
+// Avoid Swift 6.4 @State macro expansion: Command Line Tools may lack SwiftUIMacros.
+// This alias retains Apple's SwiftUI.State property-wrapper behavior.
+private typealias StoredState<Value> = SwiftUI.State<Value>
+
 // MARK: - Live preview
 
 final class Preview: ObservableObject {
     let session = AVCaptureSession()
     @Published var status = "Starting camera…"
     private let queue = DispatchQueue(label: "gimbal.preview")
-    private var configured = false
+    private var active = false
+    private var authorized = false
+    private var observers: [NSObjectProtocol] = []
+
+    init() {
+        // Camera sessions can retain stale inputs after unplug/replug.
+        let notifications = [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification]
+        observers = notifications.map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                guard let self else { return }
+                self.queue.async { self.refreshDevice() }
+            }
+        }
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
 
     func start() {
+        queue.async { self.active = true }
         AVCaptureDevice.requestAccess(for: .video) { granted in
-            guard granted else {
-                DispatchQueue.main.async { self.status = "Camera access denied in System Settings" }
-                return
-            }
             self.queue.async {
-                if !self.configured { self.configure() }
-                if self.configured, !self.session.isRunning { self.session.startRunning() }
+                guard self.active else { return }
+                self.authorized = granted
+                guard granted else {
+                    DispatchQueue.main.async { self.status = "Camera access denied. Check System Settings." }
+                    return
+                }
+                self.refreshDevice()
             }
         }
     }
 
     func stop() {
-        queue.async { if self.session.isRunning { self.session.stopRunning() } }
+        queue.async {
+            self.active = false
+            if self.session.isRunning { self.session.stopRunning() }
+        }
     }
 
-    private func configure() {
+    // All session configuration and start/stop operations run on one serial queue.
+    private func refreshDevice() {
+        guard active && authorized else { return }
         let found = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .video, position: .unspecified)
             .devices.first { $0.localizedName.localizedCaseInsensitiveContains("pocket") || $0.modelID.contains("VendorID_11427") }
-        guard let device = found, let input = try? AVCaptureDeviceInput(device: device) else {
-            DispatchQueue.main.async { self.status = "Pocket 3 not found" }
+        let current = session.inputs.compactMap { $0 as? AVCaptureDeviceInput }.first
+
+        if let found, current?.device.uniqueID == found.uniqueID {
+            if !session.isRunning { session.startRunning() }
+            DispatchQueue.main.async { self.status = "" }
             return
         }
+
+        if session.isRunning { session.stopRunning() }
         session.beginConfiguration()
-        session.sessionPreset = .medium
-        if session.canAddInput(input) { session.addInput(input) }
+        for input in session.inputs { session.removeInput(input) }
+        var ready = false
+        if let found, let input = try? AVCaptureDeviceInput(device: found), session.canAddInput(input) {
+            session.addInput(input)
+            ready = true
+        }
         session.commitConfiguration()
-        configured = true
-        DispatchQueue.main.async { self.status = "" }
+
+        if ready { session.startRunning() }
+        DispatchQueue.main.async {
+            self.status = ready ? "" : (found == nil ? "Pocket 3 not found" : "Unable to open Pocket 3 camera")
+        }
     }
 }
 
@@ -70,6 +110,14 @@ struct PreviewView: NSViewRepresentable {
     func updateNSView(_ nsView: LayerView, context: Context) {}
 }
 
+// MARK: - Saved camera positions
+
+struct SavedPosition: Codable {
+    let slot: Int
+    let pan: Double
+    let tilt: Double
+}
+
 // MARK: - Gimbal controller
 
 @MainActor
@@ -80,50 +128,306 @@ final class Gimbal: ObservableObject {
     @Published var tilt = 0.0
     @Published var connected = false
     @Published var range = ptz_range_t(panMin: -35, panMax: 215, tiltMin: -90, tiltMax: 90)
+    @Published private(set) var savedPositions: [SavedPosition] = []
+    @Published private(set) var isTransitioning = false
+    // zoom is the requested value; zoomActual is the last reported camera value.
+    @Published var zoom = 1.0
+    @Published private(set) var zoomActual = 1.0
+    @Published private(set) var zoomMin = 1.0
+    @Published private(set) var zoomMax = 4.0
+    @Published private(set) var zoomAvailable = false
+    @Published private(set) var zoomStatus = "Connect your Pocket 3"
 
     @AppStorage("step") var step = 15.0
     @AppStorage("invertPan") var invertPan = false
     @AppStorage("homePan") var homePan = 180.0
     @AppStorage("homeTilt") var homeTilt = 0.0
+    // Degrees per 200 ms software step. This is not a hardware motor-speed setting.
+    @AppStorage("presetMotionStep") var presetMotionStep = 6.0
+    @AppStorage("hotkeysEnabled") var hotkeysEnabled = true
+    @AppStorage("hotkeyModifiers") var hotkeyModifiers = 0
+    @Published var hotkeyStatus = ""
+
+    var shortcutPrefix: String {
+        switch hotkeyModifiers {
+        case 1: return "⌘⌥"
+        case 2: return "⌃⇧"
+        default: return "⌃⌥"
+        }
+    }
 
     private let usb = DispatchQueue(label: "gimbal.usb")
     private var pending: (Double, Double)?
     private var sending = false
+    private var reading = false
+    private var moveRevision: UInt64 = 0
+    private var rangeAttempted = false
+    private var zoomRangeAttempted = false
+    private var zoomPollingTicks = 0
+    private var zoomEditing = false
+    private var zoomSending = false
+    private var zoomPending: Int32?
+    private var zoomCommitTimer: Timer?
+    private var zoomRevision: UInt64 = 0
+    private var zoomSettlingUntil = Date.distantPast
     private var timer: Timer?
+    private var transitionTimer: Timer?
+    private var transitionDestination: (pan: Double, tilt: Double)?
+    private let positionsKey = "ov.gimbalbar.savedPositions.v1"
 
     init() {
-        refresh()
-        usb.async {
-            var r = ptz_range_t()
-            if ptz_range(&r) == 0 { Task { @MainActor in self.range = r } }
+        if let data = UserDefaults.standard.data(forKey: positionsKey),
+           let positions = try? JSONDecoder().decode([SavedPosition].self, from: data) {
+            savedPositions = positions.filter { (1...3).contains($0.slot) }
         }
+        refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
             Task { @MainActor in self.refresh() }
         }
     }
 
     func refresh() {
-        guard !sending else { return }
+        // PTZ and zoom share a single serial IOKit USB queue.
+        guard !sending && !reading && !zoomSending else { return }
+        reading = true
+        let revision = moveRevision
+        let probeRange = !rangeAttempted
+        let probeZoom = !zoomRangeAttempted
+        zoomPollingTicks += 1
+        let readZoom = probeZoom || zoomPollingTicks >= 2
+        if readZoom { zoomPollingTicks = 0 }
+        let zoomReadRevision = zoomRevision
         usb.async {
             var p = 0.0, t = 0.0
             let ok = ptz_get(&p, &t) == 0
+            var discoveredRange = ptz_range_t()
+            let gotRange = ok && probeRange && ptz_range(&discoveredRange) == 0
+
+            var zMin: Int32 = 0, zMax: Int32 = 0, zCurrent: Int32 = 0
+            let gotZoomRange = ok && probeZoom && ptz_zoom_range(&zMin, &zMax) == 0
+            let gotZoomCurrent = ok && readZoom && ptz_zoom_get(&zCurrent) == 0
+
             Task { @MainActor in
+                self.reading = false
                 self.connected = ok
-                if ok, !self.sending { self.pan = p; self.tilt = t }
+                if ok {
+                    if probeRange { self.rangeAttempted = true }
+                    if gotRange { self.range = discoveredRange }
+                    if probeZoom {
+                        self.zoomRangeAttempted = true
+                        // Limit the experimental UI to the camera's verified 1×–4× range.
+                        self.zoomAvailable = gotZoomRange && zMin >= 100
+                            && zMax <= 400 && zMax > zMin
+                        if self.zoomAvailable {
+                            self.zoomMin = Double(zMin) / 100.0
+                            self.zoomMax = Double(zMax) / 100.0
+                            self.zoomStatus = ""
+                        } else {
+                            self.zoomStatus = "Native zoom unavailable over USB"
+                        }
+                    }
+                    // Exibir a leitura real separadamente. Leituras iniciadas antes de
+                    // a new command must never override the requested slider position.
+                    if gotZoomCurrent && self.zoomAvailable &&
+                        self.zoomRevision == zoomReadRevision && !self.zoomSending {
+                        let measured = min(max(Double(zCurrent) / 100.0,
+                                               self.zoomMin), self.zoomMax)
+                        self.zoomActual = measured
+                        if !self.zoomEditing && self.zoomPending == nil &&
+                           Date() >= self.zoomSettlingUntil {
+                            // Only a reading after the settling period can update
+                            // the slider to reflect the last reported camera position.
+                            self.zoom = measured
+                            self.zoomStatus = ""
+                        }
+                    }
+                    // Ignore stale PTZ reads invalidated by a user movement.
+                    if !self.sending && !self.isTransitioning &&
+                        self.moveRevision == revision {
+                        self.pan = p
+                        self.tilt = t
+                    }
+                } else {
+                    // Re-probe on the next USB reconnect.
+                    self.rangeAttempted = false
+                    self.zoomRangeAttempted = false
+                    self.zoomAvailable = false
+                    self.zoomEditing = false
+                    self.zoomPending = nil
+                    self.zoomCommitTimer?.invalidate()
+                    self.zoomCommitTimer = nil
+                    self.zoomRevision &+= 1
+                    self.zoomStatus = "Connect your Pocket 3"
+                    self.cancelTransition()
+                }
             }
         }
     }
 
-    // Latest target wins; USB writes never queue up behind a drag.
+    // Coalesce zoom commands: at most one request per 160 ms interval.
+    // UI stays responsive during USB writes; the latest target wins.
+    func selectZoom(_ requested: Double) {
+        guard connected && zoomAvailable else { return }
+        let clamped = min(max(requested, zoomMin), zoomMax)
+        let target = (clamped * 10.0).rounded() / 10.0
+        zoom = target
+        zoomPending = Int32((target * 100.0).rounded())
+        zoomRevision &+= 1
+        zoomStatus = "Adjusting zoom…"
+        scheduleZoomCommit()
+    }
+
+    func zoomEditingChanged(_ editing: Bool) {
+        zoomEditing = editing
+        if !editing {
+            // Send the final target as soon as the user releases the slider.
+            zoomCommitTimer?.invalidate()
+            zoomCommitTimer = nil
+            sendPendingZoom()
+        }
+    }
+
+    func setZoom(_ requested: Double) {
+        // Share slider pipeline: the 1x button can supersede a slow write
+        // and only queues its latest target, without blocking the UI.
+        selectZoom(requested)
+        zoomCommitTimer?.invalidate()
+        zoomCommitTimer = nil
+        sendPendingZoom()
+    }
+
+    private func scheduleZoomCommit() {
+        guard zoomCommitTimer == nil && !zoomSending else { return }
+        zoomCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.16,
+                                               repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.zoomCommitTimer = nil
+                self?.sendPendingZoom()
+            }
+        }
+    }
+
+    private func sendPendingZoom() {
+        guard connected && zoomAvailable && !zoomSending,
+              let target = zoomPending else { return }
+        zoomPending = nil
+        zoomSending = true
+        let verifiedMin = Int32((zoomMin * 100.0).rounded())
+        let verifiedMax = Int32((zoomMax * 100.0).rounded())
+
+        usb.async {
+            // Zoom range was queried on connect and is revalidated by the C driver.
+            // Avoid two additional GETs for each incremental adjustment.
+            let ok = ptz_zoom_set_checked(target, verifiedMin, verifiedMax) == 0
+            Task { @MainActor in
+                self.zoomSending = false
+                if !ok {
+                    self.zoomPending = nil
+                    self.zoomCommitTimer?.invalidate()
+                    self.zoomCommitTimer = nil
+                    self.zoomStatus = "Zoom request failed; reconnect the camera"
+                    self.zoomAvailable = false
+                    self.zoomRangeAttempted = false
+                    return
+                }
+                self.zoomSettlingUntil = Date().addingTimeInterval(1.2)
+                self.zoomStatus = "Waiting for camera confirmation…"
+                if self.zoomPending != nil {
+                    self.scheduleZoomCommit()
+                }
+            }
+        }
+    }
+
+    // Any manual move cancels the remaining preset trajectory.
     func go(pan: Double, tilt: Double) {
+        cancelTransition()
+        sendTarget(pan: pan, tilt: tilt)
+    }
+
+    // Latest target wins; never build a backlog of USB move commands.
+    private func sendTarget(pan: Double, tilt: Double) {
+        guard connected else { return }
         let p = min(max(pan, range.panMin), range.panMax)
         let t = min(max(tilt, range.tiltMin), range.tiltMax)
+        moveRevision &+= 1
         self.pan = p
         self.tilt = t
         pending = (p, t)
         guard !sending else { return }
         sending = true
         flush()
+    }
+
+    func savedPosition(slot: Int) -> SavedPosition? {
+        savedPositions.first { $0.slot == slot }
+    }
+
+    func savePosition(slot: Int) {
+        guard connected, !sending, !isTransitioning, (1...3).contains(slot) else { return }
+        let position = SavedPosition(slot: slot, pan: pan, tilt: tilt)
+        savedPositions.removeAll { $0.slot == slot }
+        savedPositions.append(position)
+        savedPositions.sort { $0.slot < $1.slot }
+        if let data = try? JSONEncoder().encode(savedPositions) {
+            UserDefaults.standard.set(data, forKey: positionsKey)
+        }
+    }
+
+    func recallPosition(slot: Int) {
+        guard let saved = savedPosition(slot: slot) else { return }
+        moveSmoothly(pan: saved.pan, tilt: saved.tilt)
+    }
+
+    // UVC exposes absolute positions, not a reliable motor-speed interface.
+    // Interpolate conservative 200 ms position steps, clamped to device limits.
+    func moveSmoothly(pan: Double, tilt: Double) {
+        guard connected else { return }
+        cancelTransition()
+        transitionDestination = (
+            pan: min(max(pan, range.panMin), range.panMax),
+            tilt: min(max(tilt, range.tiltMin), range.tiltMax)
+        )
+        isTransitioning = true
+        advanceTransition()
+        if isTransitioning {
+            transitionTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.advanceTransition() }
+            }
+        }
+    }
+
+    private func advanceTransition() {
+        guard connected, let target = transitionDestination else {
+            cancelTransition()
+            return
+        }
+        // Wait for the prior USB write to finish before issuing the next motor target.
+        guard !sending else { return }
+        let dx = target.pan - pan
+        let dy = target.tilt - tilt
+        let remaining = hypot(dx, dy)
+        if remaining < 0.01 {
+            cancelTransition()
+            return
+        }
+        let step = min(max(presetMotionStep, 1.0), 9.0)
+        let fraction = min(1.0, step / remaining)
+        sendTarget(pan: pan + dx * fraction, tilt: tilt + dy * fraction)
+        if fraction >= 1.0 { cancelTransition() }
+    }
+
+    private func cancelTransition() {
+        transitionTimer?.invalidate()
+        transitionTimer = nil
+        transitionDestination = nil
+        isTransitioning = false
+    }
+
+    func stopTransition() {
+        cancelTransition()
+        // The in-flight USB request cannot be retracted; no further steps are queued.
+        pending = nil
     }
 
     private func flush() {
@@ -133,6 +437,14 @@ final class Gimbal: ObservableObject {
             let ok = ptz_set(p, t) == 0
             Task { @MainActor in
                 self.connected = ok
+                if !ok {
+                    // Stop issuing queued moves after a USB error.
+                    self.pending = nil
+                    self.sending = false
+                    self.rangeAttempted = false
+                    self.cancelTransition()
+                    return
+                }
                 self.flush()
             }
         }
@@ -143,7 +455,7 @@ final class Gimbal: ObservableObject {
         go(pan: pan + dx * step * sign, tilt: tilt + dy * step)
     }
 
-    func recenter() { go(pan: homePan, tilt: homeTilt) }
+    func recenter() { moveSmoothly(pan: homePan, tilt: homeTilt) }
 
     func setHome() {
         homePan = pan
@@ -151,39 +463,98 @@ final class Gimbal: ObservableObject {
     }
 }
 
-// MARK: - Global hotkeys (⌃⌥ + arrows, ⌃⌥C)
+// MARK: - Global shortcuts
 
 enum HotKeys {
     private static var refs: [EventHotKeyRef?] = []
+    private static var handlerInstalled = false
+    private(set) static var status = "Not configured"
 
     static func register() {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
-            var id = EventHotKeyID()
-            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
-                              nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
-            Task { @MainActor in
-                let g = Gimbal.shared
-                switch id.id {
-                case 1: g.nudge(dx: -1, dy: 0)
-                case 2: g.nudge(dx: 1, dy: 0)
-                case 3: g.nudge(dx: 0, dy: 1)
-                case 4: g.nudge(dx: 0, dy: -1)
-                case 5: g.recenter()
-                default: break
+        if !handlerInstalled {
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            let result = InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+                var id = EventHotKeyID()
+                let result = GetEventParameter(
+                    event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                    nil, MemoryLayout<EventHotKeyID>.size, nil, &id
+                )
+                guard result == noErr else { return noErr }
+                Task { @MainActor in
+                    let g = Gimbal.shared
+                    switch id.id {
+                    case 1: g.nudge(dx: -1, dy: 0)
+                    case 2: g.nudge(dx: 1, dy: 0)
+                    case 3: g.nudge(dx: 0, dy: 1)
+                    case 4: g.nudge(dx: 0, dy: -1)
+                    case 5: g.recenter()
+                    case 6: g.recallPosition(slot: 1)
+                    case 7: g.recallPosition(slot: 2)
+                    case 8: g.recallPosition(slot: 3)
+                    default: break
+                    }
                 }
+                return noErr
+            }, 1, &spec, nil, nil)
+            guard result == noErr else {
+                status = "Unable to register global shortcuts"
+                return
             }
-            return noErr
-        }, 1, &spec, nil, nil)
-
-        let mods = UInt32(controlKey | optionKey)
-        let keys = [kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow, kVK_ANSI_C]
-        for (i, key) in keys.enumerated() {
-            var ref: EventHotKeyRef?
-            RegisterEventHotKey(UInt32(key), mods, EventHotKeyID(signature: OSType(0x47424152), id: UInt32(i + 1)),
-                                GetApplicationEventTarget(), 0, &ref)
-            refs.append(ref)
+            handlerInstalled = true
         }
+        _ = configure()
+    }
+
+    @discardableResult
+    static func configure() -> String {
+        for ref in refs {
+            if let ref { UnregisterEventHotKey(ref) }
+        }
+        refs.removeAll()
+
+        guard handlerInstalled else {
+            status = "Global shortcuts unavailable"
+            return status
+        }
+
+        let defaults = UserDefaults.standard
+        let enabled = defaults.object(forKey: "hotkeysEnabled") as? Bool ?? true
+        guard enabled else {
+            status = "Shortcuts disabled"
+            return status
+        }
+
+        let modifier: UInt32
+        switch defaults.integer(forKey: "hotkeyModifiers") {
+        case 1: modifier = UInt32(cmdKey | optionKey)
+        case 2: modifier = UInt32(controlKey | shiftKey)
+        default: modifier = UInt32(controlKey | optionKey)
+        }
+
+        let keys = [
+            kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
+            kVK_ANSI_C, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3
+        ]
+
+        var failures = 0
+        for (index, key) in keys.enumerated() {
+            var ref: EventHotKeyRef?
+            let result = RegisterEventHotKey(
+                UInt32(key), modifier,
+                EventHotKeyID(signature: OSType(0x47424152), id: UInt32(index + 1)),
+                GetApplicationEventTarget(), 0, &ref
+            )
+            if result == noErr {
+                refs.append(ref)
+            } else {
+                failures += 1
+            }
+        }
+
+        status = failures == 0
+            ? "8 shortcuts active"
+            : "\(8 - failures)/8 shortcuts active — check for macOS conflicts"
+        return status
     }
 }
 
@@ -191,7 +562,7 @@ enum HotKeys {
 
 struct Pad: View {
     @ObservedObject var g: Gimbal
-    @State private var dragging = false
+    @StoredState private var dragging = false
 
     var body: some View {
         GeometryReader { geo in
@@ -230,7 +601,7 @@ struct Pad: View {
                 }
                 .onEnded { _ in dragging = false })
         }
-        .frame(height: 150)
+        .frame(height: 112)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
@@ -255,90 +626,238 @@ struct Panel: View {
     @StateObject private var preview = Preview()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Osmo Pocket 3").font(.headline)
-                    HStack(spacing: 5) {
-                        Circle().fill(g.connected ? .green : .secondary).frame(width: 6, height: 6)
-                        Text(g.connected ? "Connected" : "Not connected")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Pan \(Int(g.pan.rounded()))°")
-                    Text("Tilt \(Int(g.tilt.rounded()))°")
-                }
-                .font(.system(.caption, design: .rounded).monospacedDigit())
-                .foregroundStyle(.secondary)
-            }
-
-            ZStack {
-                Rectangle().fill(.black)
-                PreviewView(session: preview.session)
-                if !preview.status.isEmpty {
-                    Text(preview.status).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: 288, height: 162) // 16:9 at the panel's content width; video views have no intrinsic size
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.separator, lineWidth: 0.5))
-
-            Pad(g: g)
-
-            HStack(spacing: 16) {
-                Grid(horizontalSpacing: 4, verticalSpacing: 4) {
-                    GridRow {
-                        Color.clear.frame(width: 34, height: 34)
-                        ArrowButton(symbol: "chevron.up") { g.nudge(dx: 0, dy: 1) }
-                        Color.clear.frame(width: 34, height: 34)
-                    }
-                    GridRow {
-                        ArrowButton(symbol: "chevron.left") { g.nudge(dx: -1, dy: 0) }
-                        ArrowButton(symbol: "scope") { g.recenter() }
-                        ArrowButton(symbol: "chevron.right") { g.nudge(dx: 1, dy: 0) }
-                    }
-                    GridRow {
-                        Color.clear.frame(width: 34, height: 34)
-                        ArrowButton(symbol: "chevron.down") { g.nudge(dx: 0, dy: -1) }
-                        Color.clear.frame(width: 34, height: 34)
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Step").font(.caption).foregroundStyle(.secondary)
-                    Picker("Step", selection: $g.step) {
-                        Text("5°").tag(5.0)
-                        Text("15°").tag(15.0)
-                        Text("30°").tag(30.0)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-
-                    Button("Set as Center") { g.setHome() }
-                        .controlSize(.small)
-                    Toggle("Invert Pan", isOn: $g.invertPan)
-                        .toggleStyle(.checkbox)
-                        .controlSize(.small)
-                }
-            }
-
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("GimbalBar").font(.title3.weight(.semibold))
+                                Text("DJI Osmo Pocket 3")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                HStack(spacing: 5) {
+                                    Circle().fill(g.connected ? .green : .secondary).frame(width: 6, height: 6)
+                                    Text(g.connected ? "Connected" : "Not connected")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("Pan \(Int(g.pan.rounded()))°")
+                                Text("Tilt \(Int(g.tilt.rounded()))°")
+                            }
+                            .font(.system(.caption, design: .rounded).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        }
             Divider()
+            HStack(alignment: .top, spacing: 18) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                                    Label("Live preview", systemImage: "video")
+                                        .font(.subheadline.weight(.medium))
+                                    Spacer()
+                                    if !g.connected {
+                                        Image(systemName: "video.slash")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                    
+                                ZStack {
+                                    Rectangle().fill(.black)
+                                    PreviewView(session: preview.session)
+                                    if !preview.status.isEmpty {
+                                        Text(preview.status)
+                                    .font(.caption)
+                                    .foregroundStyle(.white)
+                                    .multilineTextAlignment(.center)
+                                    .padding(10)
+                                    }
+                                }
+                                .frame(width: 288, height: 162) // 16:9 at the panel's content width; video views have no intrinsic size
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.separator, lineWidth: 0.5))
+                    
+                                HStack {
+                                    Label("Manual controls", systemImage: "move")
+                                        .font(.subheadline.weight(.medium))
+                                    Spacer()
+                                    Text("Click or drag")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
+                    
+                                Pad(g: g).disabled(!g.connected)
+                    
+                                HStack(spacing: 16) {
+                                    Grid(horizontalSpacing: 4, verticalSpacing: 4) {
+                                        GridRow {
+                                            Color.clear.frame(width: 34, height: 34)
+                                            ArrowButton(symbol: "chevron.up") { g.nudge(dx: 0, dy: 1) }
+                                            Color.clear.frame(width: 34, height: 34)
+                                        }
+                                        GridRow {
+                                            ArrowButton(symbol: "chevron.left") { g.nudge(dx: -1, dy: 0) }
+                                            ArrowButton(symbol: "scope") { g.recenter() }
+                                            ArrowButton(symbol: "chevron.right") { g.nudge(dx: 1, dy: 0) }
+                                        }
+                                        GridRow {
+                                            Color.clear.frame(width: 34, height: 34)
+                                            ArrowButton(symbol: "chevron.down") { g.nudge(dx: 0, dy: -1) }
+                                            Color.clear.frame(width: 34, height: 34)
+                                        }
+                                    }
+                    
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        Text("Step").font(.caption).foregroundStyle(.secondary)
+                                        Picker("Step", selection: $g.step) {
+                                            Text("5°").tag(5.0)
+                                            Text("15°").tag(15.0)
+                                            Text("30°").tag(30.0)
+                                        }
+                                        .pickerStyle(.segmented)
+                                        .labelsHidden()
+                    
+                                        Button("Set as Center") { g.setHome() }
+                                            .controlSize(.small)
+                                        Toggle("Invert Pan", isOn: $g.invertPan)
+                                            .toggleStyle(.checkbox)
+                                            .controlSize(.small)
+                                    }
+                                }
+                                .disabled(!g.connected)
+                }
+                .frame(width: 302)
+                Divider()
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 9) {
+                                    HStack {
+                                        Label("Saved positions", systemImage: "bookmark")
+                                            .font(.subheadline.weight(.medium))
+                                        Spacer()
+                                        if g.isTransitioning {
+                                            Button("Stop movement") { g.stopTransition() }
+                                                .controlSize(.small)
+                                        }
+                                    }
+                    
+                                    ForEach(1...3, id: \.self) { slot in
+                                        let saved = g.savedPosition(slot: slot)
+                                        HStack(spacing: 8) {
+                                            Text("P\(slot)")
+                                                .font(.system(.caption, design: .rounded).weight(.semibold))
+                                                .frame(width: 24, alignment: .leading)
+                                            if let saved {
+                                                Text("\(Int(saved.pan.rounded()))° / \(Int(saved.tilt.rounded()))°")
+                                                    .foregroundStyle(.secondary)
+                                                    .font(.caption.monospacedDigit())
+                                            } else {
+                                                Text("Empty").foregroundStyle(.tertiary).font(.caption)
+                                            }
+                                            Spacer(minLength: 4)
+                                            Button("Save") { g.savePosition(slot: slot) }
+                                                .disabled(!g.connected || g.isTransitioning)
+                                                .controlSize(.small)
+                                            Button("Go") { g.recallPosition(slot: slot) }
+                                                .disabled(!g.connected || saved == nil)
+                                                .controlSize(.small)
+                                        }
+                                    }
+                    
+                                    HStack(spacing: 8) {
+                                        Text("Motion style").font(.caption).foregroundStyle(.secondary)
+                                        Picker("Motion style", selection: $g.presetMotionStep) {
+                                            Text("Gentle").tag(3.0)
+                                            Text("Normal").tag(6.0)
+                                            Text("Quick").tag(9.0)
+                                        }
+                                        .pickerStyle(.segmented)
+                                        .labelsHidden()
+                                    }
+                                    Text("Software steps; not hardware motor speed")
+                                        .font(.caption2).foregroundStyle(.tertiary)
+                                }
+                    Divider()
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("Camera zoom", systemImage: "plus.magnifyingglass")
+                                .font(.subheadline.weight(.medium))
+                            Spacer()
+                            Text(String(format: "%.1f×", g.zoom))
+                                .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                                .monospacedDigit()
+                        }
 
-            HStack {
-                Text("⌃⌥ ←↑↓→ move   ⌃⌥C center")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                        HStack(spacing: 9) {
+                            Slider(value: Binding(
+                                get: { g.zoom },
+                                set: { g.selectZoom($0) }
+                            ), in: g.zoomMin...g.zoomMax, step: 0.1,
+                                   onEditingChanged: { editing in
+                                g.zoomEditingChanged(editing)
+                            })
+                            .disabled(!g.connected || !g.zoomAvailable)
+                            Button("1×") { g.setZoom(g.zoomMin) }
+                                .disabled(!g.connected || !g.zoomAvailable)
+                                .controlSize(.small)
+                        }
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(String(format: "Camera: %.1f×", g.zoomActual))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            Text(g.zoomStatus)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Divider()
+                    VStack(alignment: .leading, spacing: 10) {
+                                    Label("Keyboard shortcuts", systemImage: "keyboard")
+                                        .font(.subheadline.weight(.medium))
+                    
+                                    Toggle("Enable global shortcuts", isOn: $g.hotkeysEnabled)
+                                        .toggleStyle(.switch)
+                                        .onChange(of: g.hotkeysEnabled) {
+                                            g.hotkeyStatus = HotKeys.configure()
+                                        }
+                    
+                                    Picker("Modifier keys", selection: $g.hotkeyModifiers) {
+                                        Text("⌃⌥").tag(0)
+                                        Text("⌘⌥").tag(1)
+                                        Text("⌃⇧").tag(2)
+                                    }
+                                    .pickerStyle(.segmented)
+                                    .disabled(!g.hotkeysEnabled)
+                                    .onChange(of: g.hotkeyModifiers) {
+                                        g.hotkeyStatus = HotKeys.configure()
+                                    }
+                    
+                                    Text("\(g.shortcutPrefix) + arrows: move · C: center · 1–3: presets")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Text(g.hotkeyStatus)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                    Spacer(minLength: 0)
+                }
+                .frame(width: 304, alignment: .leading)
             }
+            .frame(maxHeight: .infinity, alignment: .top)
+            Divider()
+            HStack {
+                            Text("GimbalBar 1.2 · Native zoom")
+                                .font(.caption2).foregroundStyle(.tertiary)
+                            Spacer()
+                            Button("Quit") { NSApp.terminate(nil) }
+                                .buttonStyle(.plain)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
         }
         .padding(16)
-        .frame(width: 320)
-        .onAppear { preview.start() }
+        .frame(width: 690, height: 620)
+        .onAppear {
+            preview.start()
+            g.hotkeyStatus = HotKeys.status
+        }
         .onDisappear { preview.stop() }
         .focusable()
         .focusEffectDisabled()
@@ -348,13 +867,12 @@ struct Panel: View {
         .onKeyPress(.downArrow) { g.nudge(dx: 0, dy: -1); return .handled }
     }
 }
-
 @main
 struct GimbalBarApp: App {
     init() { HotKeys.register() }
 
     var body: some Scene {
-        MenuBarExtra("Gimbal", systemImage: "camera.viewfinder") {
+        MenuBarExtra("Gimbal controls", systemImage: "camera.viewfinder") {
             Panel()
         }
         .menuBarExtraStyle(.window)
