@@ -1,86 +1,51 @@
-# GimbalBar 1.1 — instalação e validação
+# GimbalBar — building and hardware testing
 
-Projeto derivado do GimbalBar original de https://github.com/amirmxt/gimbalbar. Histórico e licença MIT preservados. Compilação e testes devem ser realizados localmente para economizar GitHub Actions.
+This is an optional local smoke-test checklist for the DJI Osmo Pocket 3 USB webcam. Development builds should be tested with the actual camera: the IOKit UVC interface cannot be fully validated on a CI runner.
 
-## Requisitos
+## Requirements
 
-- Mac Apple Silicon com macOS 14 ou posterior
+- Apple Silicon Mac running macOS 14 or later
 - Xcode Command Line Tools
-- DJI Osmo Pocket 3 conectada por USB-C e configurada em **Webcam**
-- Permissão de câmera para o GimbalBar no macOS
+- DJI Osmo Pocket 3 connected via USB-C in **Webcam** mode
+- Camera access allowed in macOS System Settings
 
-## Recursos disponíveis
-
-- Prévia ao vivo e controle USB do gimbal
-- Reconexão automática da câmera
-- Interface horizontal em português brasileiro, com duas colunas e **sem rolagem**
-- Três posições persistentes (P1, P2, P3) e recuperação com movimento em etapas
-- Movimento por software em ritmos **Suave**, **Normal** e **Rápida**
-- Atalhos globais habilitáveis e três perfis de modificadores (⌃⌥, ⌘⌥, ⌃⇧), com setas, C e teclas 1–3
-- Interromper movimento iniciado por preset; operação manual cancela a trajetória programada
-
-A movimentação suave é implementada enviando pequenas posições absolutas, não por ajuste direto da velocidade do motor. A câmera pode continuar completando um comando já recebido mesmo após interromper o envio de novas etapas. Não constitui parada de emergência.
-
-## Instalar a compilação consolidada
-
-Após as PRs #2 e #3 serem integradas à `main`, feche o GimbalBar e execute:
+## Build a standalone test copy
 
 ```bash
-cd ~/Projects/gimbalbar
-git switch main
-git pull --ff-only
 ./build.sh
+open ./GimbalBar.app
 ```
 
-**Continue apenas se aparecer `Built .../GimbalBar.app` e não houver erro.**
+The build script recreates `build/` and `GimbalBar.app/` **inside the repository**. It does not overwrite `/Applications/GimbalBar.app`. Close other running GimbalBar instances during testing to avoid conflicts with global hotkeys.
 
-```bash
-pkill -x GimbalBar 2>/dev/null || true
-backup="$HOME/Desktop/GimbalBar-backup-antes-1.1.app"
-if [ -d /Applications/GimbalBar.app ] && [ ! -e "$backup" ]; then
-  ditto /Applications/GimbalBar.app "$backup"
-fi
-ditto ./GimbalBar.app /Applications/GimbalBar.app
-open /Applications/GimbalBar.app
-```
+## Smoke tests
 
-Isso preserva um backup único da versão anterior na Mesa e substitui o aplicativo instalado somente depois da compilação bem-sucedida. O identificador do aplicativo foi mantido, preservando as preferências locais.
+1. **No camera:** Panel reports a disconnected device. Camera controls should not send motor commands.
+2. **Connect:** Plug in the Pocket 3 in Webcam mode. Confirm the connection indicator, live preview, and real pan/tilt values.
+3. **Manual controls:** Try a small 5° movement with each arrow, drag the control pad, invert pan, and recenter.
+4. **USB reconnection:** Disconnect/reconnect with the panel open, then closed. The preview and motor control should recover without relaunching.
+5. **Saved positions:** Save P1/P2/P3; recall them one at a time. The transition should be made of small steps rather than one instantaneous far target. Confirm they persist after restarting the app.
+6. **Interrupt movement:** Start recalling a saved position, then press Stop or move manually. No further software steps should queue. A command already received by the gimbal may still finish.
+7. **Native zoom:** Confirm the camera-advertised range. Start from 1×, request approximately 1.2×, then 2×, then reset to 1×. Verify the actual image changes; the selected slider target and readback from the camera should converge after movement ends.
+8. **Zoom while dragging:** Slowly drag 1×→2×. The UI should remain responsive. Intermediate requests should be coalesced, and pressing the 1× reset button should supersede the prior target.
+9. **Global shortcuts:** Check Control–Option + arrows/C/1–3 from another app. Switch to Command–Option and Control–Shift, and verify that disabling shortcuts unregisters them. Some combinations may be reserved by macOS.
+10. **Authorization:** Revoke camera permission and relaunch; confirm a useful error message.
 
-## Testes essenciais da versão 1.1
+Motor movements should be tested with the gimbal on a stable surface and unobstructed. Do not run tests unattended or during important recordings.
 
-1. Confirmar que o painel horizontal aparece inteiro, sem barra de rolagem, em português.
-2. Validar prévia, movimentação pelo pad e setas, inversão horizontal e centralização.
-3. Salvar P1, P2 e P3; retornar a cada uma e conferir persistência após fechar/reabrir.
-4. Testar movimentos Suave, Normal e Rápida e o comando **Interromper**.
-5. Durante um retorno a posição salva, movimentar manualmente e verificar cancelamento da trajetória programada.
-6. Ativar/desativar atalhos, alternar perfis ⌃⌥ / ⌘⌥ / ⌃⇧ e recuperar P1–P3.
-7. Desconectar/reconectar a Pocket 3 em Webcam e conferir retomada da prévia e controles.
-8. Confirmar que a ausência da câmera não executa movimentos de gimbal.
+## Known constraints
 
-**Segurança:** manter motores desobstruídos, iniciar com ritmo Suave e evitar movimentos sem supervisão.
+- Zoom control is based on the standard Camera Terminal Zoom Absolute UVC selector `0x0B`, **not** on a crop inside the preview.
+- A tested Pocket 3 reported `GET_MIN=100`, `GET_MAX=400`, corresponding to 1×–4×. The runtime probes its range and refuses unsupported values.
+- The tested firmware did not advertise UVC exposure, focus, or white-balance controls.
+- Interpolated pan/tilt is software stepping; UVC does not provide this code a motor-speed setting.
+- A fast response from `SET_CUR` does not necessarily mean the lens/ISP has completed its digital zoom. The panel displays separately the requested target and camera-reported `GET_CUR`.
+- Real-device testing of the contributor's fork was completed on October 21, 2026 with a Pocket 3 in Webcam mode, including restored preview after reconnection, presets, and responsive zoom. This PR has not run automated hardware tests.
 
-## Histórico de validação — 21/10/2026
+## Swift toolchain warning
 
-- Versão 1.0: compilação local e controles USB funcionando; reconexão validada pelo usuário.
-- Versão 1.1, PR #2: usuário confirmou que a versão experimental funcionou.
-- Versão 1.1, PR #3: a primeira tentativa de layout com `ScrollView` ficou praticamente invisível. Foi substituída por um painel horizontal de largura e altura fixas, sem rolagem, traduzido para português.
-- Usuário aprovou o novo layout e posteriormente confirmou: **"Tudo ok"**, em resposta à solicitação de validação funcional de atalhos, cancelamento e reconexão.
-- Confirmação de compilação/instalação do executável **consolidado da `main`** ainda é necessária; o teste anterior foi feito na branch experimental, antes da atualização dos metadados da versão.
+On one Apple Silicon Command Line Tools installation, direct `@State` usage required a SwiftUIMacros plugin unavailable to the compiler. The code therefore uses an alias to `SwiftUI.State` for the drag property. If the build fails, capture `swiftc --version`, `xcode-select -p`, and the complete diagnostics.
 
-## Diagnóstico do compilador
+## Source and licensing
 
-Uma versão anterior falhou com `SwiftUIMacros.StateMacro` não encontrado nas Command Line Tools. O ajuste `@StoredState` contornou essa incompatibilidade no MacBook testado.
-
-Em caso de erro no build:
-
-```bash
-xcode-select -p
-xcrun --find swiftc
-swiftc --version
-```
-
-Referência do problema: https://github.com/drumih/turbo-fieldfare/issues/185
-
-## Política de integração
-
-Desenvolvimento em branches, PRs de revisão e testes de hardware locais. Não habilitar automações de CI custosas apenas para reproduzir testes que exigem a câmera.
+This checklist accompanies the [GimbalBar](https://github.com/amirmxt/gimbalbar) project. The original author's MIT license and attribution are retained.
