@@ -1,0 +1,7 @@
+build/
+GimbalBar.app/
+.DS_Store
+# icon drafts; only the shipped icon is tracked
+icon/*
+!icon/icon-1024.png
+!icon/PROMPT.md
