@@ -10,7 +10,7 @@ private typealias StoredState<Value> = SwiftUI.State<Value>
 
 final class Preview: ObservableObject {
     let session = AVCaptureSession()
-    @Published var status = "Iniciando câmera…"
+    @Published var status = "Starting camera…"
     private let queue = DispatchQueue(label: "gimbal.preview")
     private var active = false
     private var authorized = false
@@ -38,7 +38,7 @@ final class Preview: ObservableObject {
                 guard self.active else { return }
                 self.authorized = granted
                 guard granted else {
-                    DispatchQueue.main.async { self.status = "Acesso à câmera negado. Verifique os Ajustes do Sistema." }
+                    DispatchQueue.main.async { self.status = "Camera access denied. Check System Settings." }
                     return
                 }
                 self.refreshDevice()
@@ -78,7 +78,7 @@ final class Preview: ObservableObject {
 
         if ready { session.startRunning() }
         DispatchQueue.main.async {
-            self.status = ready ? "" : (found == nil ? "Pocket 3 não encontrada" : "Não foi possível abrir a câmera Pocket 3")
+            self.status = ready ? "" : (found == nil ? "Pocket 3 not found" : "Unable to open Pocket 3 camera")
         }
     }
 }
@@ -136,7 +136,7 @@ final class Gimbal: ObservableObject {
     @Published private(set) var zoomMin = 1.0
     @Published private(set) var zoomMax = 4.0
     @Published private(set) var zoomAvailable = false
-    @Published private(set) var zoomStatus = "Conecte a Pocket 3"
+    @Published private(set) var zoomStatus = "Connect your Pocket 3"
 
     @AppStorage("step") var step = 15.0
     @AppStorage("invertPan") var invertPan = false
@@ -223,7 +223,7 @@ final class Gimbal: ObservableObject {
                             self.zoomMax = Double(zMax) / 100.0
                             self.zoomStatus = ""
                         } else {
-                            self.zoomStatus = "Zoom nativo indisponível via USB"
+                            self.zoomStatus = "Native zoom unavailable over USB"
                         }
                     }
                     // Exibir a leitura real separadamente. Leituras iniciadas antes de
@@ -257,7 +257,7 @@ final class Gimbal: ObservableObject {
                     self.zoomCommitTimer?.invalidate()
                     self.zoomCommitTimer = nil
                     self.zoomRevision &+= 1
-                    self.zoomStatus = "Conecte a Pocket 3"
+                    self.zoomStatus = "Connect your Pocket 3"
                     self.cancelTransition()
                 }
             }
@@ -273,7 +273,7 @@ final class Gimbal: ObservableObject {
         zoom = target
         zoomPending = Int32((target * 100.0).rounded())
         zoomRevision &+= 1
-        zoomStatus = "Ajustando zoom…"
+        zoomStatus = "Adjusting zoom…"
         scheduleZoomCommit()
     }
 
@@ -325,13 +325,13 @@ final class Gimbal: ObservableObject {
                     self.zoomPending = nil
                     self.zoomCommitTimer?.invalidate()
                     self.zoomCommitTimer = nil
-                    self.zoomStatus = "Falha ao enviar zoom; reconecte a câmera"
+                    self.zoomStatus = "Zoom request failed; reconnect the camera"
                     self.zoomAvailable = false
                     self.zoomRangeAttempted = false
                     return
                 }
                 self.zoomSettlingUntil = Date().addingTimeInterval(1.2)
-                self.zoomStatus = "Aguardando confirmação da câmera…"
+                self.zoomStatus = "Waiting for camera confirmation…"
                 if self.zoomPending != nil {
                     self.scheduleZoomCommit()
                 }
@@ -468,7 +468,7 @@ final class Gimbal: ObservableObject {
 enum HotKeys {
     private static var refs: [EventHotKeyRef?] = []
     private static var handlerInstalled = false
-    private(set) static var status = "Não configurados"
+    private(set) static var status = "Not configured"
 
     static func register() {
         if !handlerInstalled {
@@ -497,7 +497,7 @@ enum HotKeys {
                 return noErr
             }, 1, &spec, nil, nil)
             guard result == noErr else {
-                status = "Não foi possível registrar os atalhos globais"
+                status = "Unable to register global shortcuts"
                 return
             }
             handlerInstalled = true
@@ -513,14 +513,14 @@ enum HotKeys {
         refs.removeAll()
 
         guard handlerInstalled else {
-            status = "Atalhos globais indisponíveis"
+            status = "Global shortcuts unavailable"
             return status
         }
 
         let defaults = UserDefaults.standard
         let enabled = defaults.object(forKey: "hotkeysEnabled") as? Bool ?? true
         guard enabled else {
-            status = "Atalhos desativados"
+            status = "Shortcuts disabled"
             return status
         }
 
@@ -552,8 +552,8 @@ enum HotKeys {
         }
 
         status = failures == 0
-            ? "8 atalhos ativos"
-            : "\(8 - failures)/8 atalhos ativos — verifique conflitos no macOS"
+            ? "8 shortcuts active"
+            : "\(8 - failures)/8 shortcuts active — check for macOS conflicts"
         return status
     }
 }
@@ -634,14 +634,14 @@ struct Panel: View {
                                     .font(.caption).foregroundStyle(.secondary)
                                 HStack(spacing: 5) {
                                     Circle().fill(g.connected ? .green : .secondary).frame(width: 6, height: 6)
-                                    Text(g.connected ? "Conectada" : "Desconectada")
+                                    Text(g.connected ? "Connected" : "Not connected")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                             Spacer()
                             VStack(alignment: .trailing, spacing: 2) {
-                                Text("Horizontal \(Int(g.pan.rounded()))°")
-                                Text("Vertical \(Int(g.tilt.rounded()))°")
+                                Text("Pan \(Int(g.pan.rounded()))°")
+                                Text("Tilt \(Int(g.tilt.rounded()))°")
                             }
                             .font(.system(.caption, design: .rounded).monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -650,7 +650,7 @@ struct Panel: View {
             HStack(alignment: .top, spacing: 18) {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                                    Label("Prévia ao vivo", systemImage: "video")
+                                    Label("Live preview", systemImage: "video")
                                         .font(.subheadline.weight(.medium))
                                     Spacer()
                                     if !g.connected {
@@ -675,10 +675,10 @@ struct Panel: View {
                                 .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.separator, lineWidth: 0.5))
                     
                                 HStack {
-                                    Label("Controle manual", systemImage: "move")
+                                    Label("Manual controls", systemImage: "move")
                                         .font(.subheadline.weight(.medium))
                                     Spacer()
-                                    Text("Clique ou arraste")
+                                    Text("Click or drag")
                                         .font(.caption2).foregroundStyle(.secondary)
                                 }
                     
@@ -704,8 +704,8 @@ struct Panel: View {
                                     }
                     
                                     VStack(alignment: .leading, spacing: 10) {
-                                        Text("Passo").font(.caption).foregroundStyle(.secondary)
-                                        Picker("Passo", selection: $g.step) {
+                                        Text("Step").font(.caption).foregroundStyle(.secondary)
+                                        Picker("Step", selection: $g.step) {
                                             Text("5°").tag(5.0)
                                             Text("15°").tag(15.0)
                                             Text("30°").tag(30.0)
@@ -713,9 +713,9 @@ struct Panel: View {
                                         .pickerStyle(.segmented)
                                         .labelsHidden()
                     
-                                        Button("Definir centro") { g.setHome() }
+                                        Button("Set as Center") { g.setHome() }
                                             .controlSize(.small)
-                                        Toggle("Inverter horizontal", isOn: $g.invertPan)
+                                        Toggle("Invert Pan", isOn: $g.invertPan)
                                             .toggleStyle(.checkbox)
                                             .controlSize(.small)
                                     }
@@ -727,11 +727,11 @@ struct Panel: View {
                 VStack(alignment: .leading, spacing: 12) {
                     VStack(alignment: .leading, spacing: 9) {
                                     HStack {
-                                        Label("Posições salvas", systemImage: "bookmark")
+                                        Label("Saved positions", systemImage: "bookmark")
                                             .font(.subheadline.weight(.medium))
                                         Spacer()
                                         if g.isTransitioning {
-                                            Button("Interromper") { g.stopTransition() }
+                                            Button("Stop movement") { g.stopTransition() }
                                                 .controlSize(.small)
                                         }
                                     }
@@ -747,35 +747,35 @@ struct Panel: View {
                                                     .foregroundStyle(.secondary)
                                                     .font(.caption.monospacedDigit())
                                             } else {
-                                                Text("Vazio").foregroundStyle(.tertiary).font(.caption)
+                                                Text("Empty").foregroundStyle(.tertiary).font(.caption)
                                             }
                                             Spacer(minLength: 4)
-                                            Button("Salvar") { g.savePosition(slot: slot) }
+                                            Button("Save") { g.savePosition(slot: slot) }
                                                 .disabled(!g.connected || g.isTransitioning)
                                                 .controlSize(.small)
-                                            Button("Ir") { g.recallPosition(slot: slot) }
+                                            Button("Go") { g.recallPosition(slot: slot) }
                                                 .disabled(!g.connected || saved == nil)
                                                 .controlSize(.small)
                                         }
                                     }
                     
                                     HStack(spacing: 8) {
-                                        Text("Movimentação").font(.caption).foregroundStyle(.secondary)
-                                        Picker("Movimentação", selection: $g.presetMotionStep) {
-                                            Text("Suave").tag(3.0)
+                                        Text("Motion style").font(.caption).foregroundStyle(.secondary)
+                                        Picker("Motion style", selection: $g.presetMotionStep) {
+                                            Text("Gentle").tag(3.0)
                                             Text("Normal").tag(6.0)
-                                            Text("Rápida").tag(9.0)
+                                            Text("Quick").tag(9.0)
                                         }
                                         .pickerStyle(.segmented)
                                         .labelsHidden()
                                     }
-                                    Text("Passos por software; não muda a velocidade dos motores")
+                                    Text("Software steps; not hardware motor speed")
                                         .font(.caption2).foregroundStyle(.tertiary)
                                 }
                     Divider()
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Label("Zoom da câmera", systemImage: "plus.magnifyingglass")
+                            Label("Camera zoom", systemImage: "plus.magnifyingglass")
                                 .font(.subheadline.weight(.medium))
                             Spacer()
                             Text(String(format: "%.1f×", g.zoom))
@@ -797,7 +797,7 @@ struct Panel: View {
                                 .controlSize(.small)
                         }
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
-                            Text(String(format: "Câmera: %.1f×", g.zoomActual))
+                            Text(String(format: "Camera: %.1f×", g.zoomActual))
                                 .font(.caption2.monospacedDigit())
                                 .foregroundStyle(.secondary)
                             Spacer(minLength: 0)
@@ -809,16 +809,16 @@ struct Panel: View {
                     }
                     Divider()
                     VStack(alignment: .leading, spacing: 10) {
-                                    Label("Atalhos de teclado", systemImage: "keyboard")
+                                    Label("Keyboard shortcuts", systemImage: "keyboard")
                                         .font(.subheadline.weight(.medium))
                     
-                                    Toggle("Ativar atalhos globais", isOn: $g.hotkeysEnabled)
+                                    Toggle("Enable global shortcuts", isOn: $g.hotkeysEnabled)
                                         .toggleStyle(.switch)
                                         .onChange(of: g.hotkeysEnabled) {
                                             g.hotkeyStatus = HotKeys.configure()
                                         }
                     
-                                    Picker("Combinação", selection: $g.hotkeyModifiers) {
+                                    Picker("Modifier keys", selection: $g.hotkeyModifiers) {
                                         Text("⌃⌥").tag(0)
                                         Text("⌘⌥").tag(1)
                                         Text("⌃⇧").tag(2)
@@ -829,7 +829,7 @@ struct Panel: View {
                                         g.hotkeyStatus = HotKeys.configure()
                                     }
                     
-                                    Text("\(g.shortcutPrefix) + setas: mover · C: centro · 1–3: posições")
+                                    Text("\(g.shortcutPrefix) + arrows: move · C: center · 1–3: presets")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                     Text(g.hotkeyStatus)
@@ -843,10 +843,10 @@ struct Panel: View {
             .frame(maxHeight: .infinity, alignment: .top)
             Divider()
             HStack {
-                            Text("Versão 1.2 · Zoom nativo experimental")
+                            Text("GimbalBar 1.2 · Native zoom")
                                 .font(.caption2).foregroundStyle(.tertiary)
                             Spacer()
-                            Button("Sair") { NSApp.terminate(nil) }
+                            Button("Quit") { NSApp.terminate(nil) }
                                 .buttonStyle(.plain)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -872,7 +872,7 @@ struct GimbalBarApp: App {
     init() { HotKeys.register() }
 
     var body: some Scene {
-        MenuBarExtra("Controle de câmera", systemImage: "camera.viewfinder") {
+        MenuBarExtra("Gimbal controls", systemImage: "camera.viewfinder") {
             Panel()
         }
         .menuBarExtraStyle(.window)
