@@ -1,5 +1,5 @@
 #!/bin/zsh
-# GimbalBar 1.2: diagnósticos USB somente leitura (NÃO modifica o app).
+# GimbalBar: read-only USB diagnostics (does not modify the app).
 set -eu
 cd "${0:A:h}"
 mkdir -p build
